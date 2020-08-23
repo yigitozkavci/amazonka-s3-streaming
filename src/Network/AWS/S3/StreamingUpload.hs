@@ -87,9 +87,10 @@ May throw 'Network.AWS.Error'
 -}
 streamUpload :: (MonadUnliftIO m, MonadAWS m, MonadFail m)
              => Maybe ChunkSize -- ^ Optional chunk size
+             -> (Int -> Int -> m ()) -- ^ Optional side effect with part number and size
              -> CreateMultipartUpload -- ^ Upload location
              -> ConduitT ByteString Void m (Either (AbortMultipartUploadResponse, SomeException) CompleteMultipartUploadResponse)
-streamUpload mChunkSize multiPartUploadDesc = do
+streamUpload mChunkSize action multiPartUploadDesc = do
   logger <- lift $ liftAWS $ view envLogger
   let logStr :: MonadIO m => String -> m ()
       logStr = liftIO . logger Debug . stringUtf8
@@ -113,7 +114,7 @@ streamUpload mChunkSize multiPartUploadDesc = do
                 rs <- lift $ performUpload partnum (bufsize + BS.length bs)
                                             (hashFinalize $ hashUpdate ctx bs)
                                             (D.snoc bss bs)
-
+                lift $ action partnum bufsize
                 logStr $ printf "\n**** Uploaded part %d size %d\n" partnum bufsize
                 let !part = completedPart partnum <$> (rs ^. uprsETag)
                 liftIO performGC
@@ -123,6 +124,7 @@ streamUpload mChunkSize multiPartUploadDesc = do
             prts <- if bufsize > 0
                 then do
                     rs <- performUpload partnum bufsize (hashFinalize ctx) bss
+                    action partnum bufsize
                     logStr $ printf "\n**** Uploaded (final) part %d size %d\n" partnum bufsize
                     let allParts = D.toList $ D.snoc completed $ completedPart partnum <$> (rs ^. uprsETag)
                     pure $ nonEmpty =<< sequence allParts
