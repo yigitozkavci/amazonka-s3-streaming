@@ -57,7 +57,7 @@ import Network.AWS.S3.UploadPart
 import Control.Applicative
 import Control.Category ((>>>))
 import Control.Monad ((>=>), forM_, when)
-import Control.Monad.Except (MonadError, throwError)
+import Control.Monad.Except (MonadError, runExceptT, throwError, withExcept)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Morph (lift)
 import Control.Monad.Reader.Class (local)
@@ -99,6 +99,17 @@ type NumThreads = Int
 minimumChunkSize :: ChunkSize
 minimumChunkSize = 6 * 1024 * 1024 -- Making this 5MB+1 seemed to cause AWS to complain
 
+data StreamUploadFailure
+  = StreamUploadAborted AbortMultipartUploadResponse SomeException
+  | UploadPartError String
+  | CreateUploadError String
+  deriving (Show)
+
+data StreamUploadResult
+  = FailedStreamUpload StreamUploadFailure
+  | SucceededStreamUpload CompleteMultipartUploadResponse
+  deriving (Show)
+
 {- |
 Given a 'CreateMultipartUpload', creates a 'Sink' which will sequentially
 upload the data streamed in in chunks of at least 'minimumChunkSize' and return either
@@ -114,96 +125,142 @@ See the AWS documentation for more details.
 May throw 'Network.AWS.Error'
 -}
 streamUpload ::
-     (MonadUnliftIO m, MonadAWS m, MonadError String m)
+     forall m. (MonadUnliftIO m, MonadAWS m)
   => Maybe ChunkSize -- ^ Optional chunk size
   -> (Int -> Int -> m ()) -- ^ Optional side effect with part number and size
   -> CreateMultipartUpload -- ^ Upload location
-  -> ConduitT ByteString Void m (Either ( AbortMultipartUploadResponse
-                                        , SomeException) CompleteMultipartUploadResponse)
-streamUpload mChunkSize action multiPartUploadDesc = do
-  logger <- lift $ liftAWS $ view envLogger
-  let logStr :: MonadIO m => String -> m ()
-      logStr = liftIO . logger Debug . stringUtf8
-      chunkSize = maybe minimumChunkSize (max minimumChunkSize) mChunkSize
+  -> ConduitT ByteString Void m StreamUploadResult
+streamUpload mChunkSize updateAction multiPartUploadDesc = do
+  let chunkSize = maybe minimumChunkSize (max minimumChunkSize) mChunkSize
   multiPartUpload <- lift $ send multiPartUploadDesc
-  when (multiPartUpload ^. cmursResponseStatus /= 200) $
-    throwError "Failed to create upload"
-  logStr "\n**** Created upload\n"
-  let Just upId = multiPartUpload ^. cmursUploadId
-      bucket = multiPartUploadDesc ^. cmuBucket
-      key = multiPartUploadDesc ^. cmuKey
-      -- go :: DList ByteString -> Int -> Context SHA256 -> Int -> DList (Maybe CompletedPart) -> Sink ByteString m ()
-      go !bss !bufsize !ctx !partnum !completed =
-        await >>= \case
-          Just bs
-            | l <- BS.length bs
-            , bufsize + l <= chunkSize ->
-              go
-                (D.snoc bss bs)
-                (bufsize + l)
-                (hashUpdate ctx bs)
-                partnum
-                completed
-            | otherwise -> do
-              rs <-
+  let createUploadResponse = multiPartUpload ^. cmursResponseStatus
+  if (createUploadResponse /= 200)
+    then do
+      lift $ logStr "\n**** Created upload\n"
+      pure $
+        FailedStreamUpload $
+        CreateUploadError $
+        "Non success create upload response: " <> show createUploadResponse
+    else do
+      let Just upId = multiPartUpload ^. cmursUploadId
+          bucket = multiPartUploadDesc ^. cmuBucket
+          key = multiPartUploadDesc ^. cmuKey
+      (go multiPartUpload chunkSize updateAction D.empty 0 hashInit 1 D.empty) `catchC` \(exc :: SomeException) -> do
+        result <- lift (send (abortMultipartUpload bucket key upId))
+        pure $ FailedStreamUpload $ StreamUploadAborted result exc
+          -- Whatever happens, we abort the upload and return the exception
+    -- go ::
+    --      Int
+    --   -> D.DList ByteString
+    --   -> Int
+    --   -> Context SHA256
+    --   -> Int
+    --   -> DList (Maybe CompletedPart)
+    --   -> Sink ByteString m ()
+  where
+    go !multiPartUpload !chunkSize !updateAction !bss !bufsize !ctx !partnum !completed = do
+      let Just upId = multiPartUpload ^. cmursUploadId
+          bucket = multiPartUploadDesc ^. cmuBucket
+          key = multiPartUploadDesc ^. cmuKey
+      await >>= \case
+        Just bs
+          | l <- BS.length bs
+          , bufsize + l <= chunkSize ->
+            go
+              multiPartUpload
+              chunkSize
+              updateAction
+              (D.snoc bss bs)
+              (bufsize + l)
+              (hashUpdate ctx bs)
+              partnum
+              completed
+          | otherwise -> do
+            lift
+              (performUpload
+                 multiPartUpload
+                 partnum
+                 (bufsize + BS.length bs)
+                 (hashFinalize $ hashUpdate ctx bs)
+                 (D.snoc bss bs)) >>= \case
+              Left err -> pure $ FailedStreamUpload $ UploadPartError err
+              Right rs -> do
                 lift $
-                performUpload
-                  partnum
-                  (bufsize + BS.length bs)
-                  (hashFinalize $ hashUpdate ctx bs)
-                  (D.snoc bss bs)
-              lift $ action partnum bufsize
-              logStr $
-                printf "\n**** Uploaded part %d size %d\n" partnum bufsize
-              let !part = completedPart partnum <$> (rs ^. uprsETag)
-              liftIO performGC
-              go empty 0 hashInit (partnum + 1) . D.snoc completed $! part
-          Nothing ->
-            lift $ do
-              prts <-
-                if bufsize > 0
-                  then do
-                    rs <- performUpload partnum bufsize (hashFinalize ctx) bss
-                    action partnum bufsize
-                    logStr $
-                      printf
-                        "\n**** Uploaded (final) part %d size %d\n"
-                        partnum
-                        bufsize
-                    let allParts =
-                          D.toList $
-                          D.snoc completed $
-                          completedPart partnum <$> (rs ^. uprsETag)
-                    pure $ nonEmpty =<< sequence allParts
-                  else do
-                    logStr $ printf "\n**** No final data to upload\n"
-                    pure $ nonEmpty =<< sequence (D.toList completed)
+                  logStr $
+                  printf "\n**** Uploaded part %d size %d\n" partnum bufsize
+                let !part = completedPart partnum <$> (rs ^. uprsETag)
+                liftIO performGC
+                go
+                  multiPartUpload
+                  chunkSize
+                  updateAction
+                  empty
+                  0
+                  hashInit
+                  (partnum + 1) .
+                  D.snoc completed $!
+                  part
+        Nothing ->
+          lift $ do
+            prts <-
+              if bufsize > 0
+                then do
+                  result <-
+                    performUpload
+                      multiPartUpload
+                      partnum
+                      bufsize
+                      (hashFinalize ctx)
+                      bss
+                  -- lift $ updateAction partnum bufsize
+                  case result of
+                    Right rs -> do
+                      logStr $
+                        printf
+                          "\n**** Uploaded (final) part %d size %d\n"
+                          partnum
+                          bufsize
+                      let allParts =
+                            D.toList $
+                            D.snoc completed $
+                            completedPart partnum <$> (rs ^. uprsETag)
+                      pure $ nonEmpty =<< sequence allParts
+                else do
+                  logStr $ printf "\n**** No final data to upload\n"
+                  pure $ nonEmpty =<< sequence (D.toList completed)
+            fmap SucceededStreamUpload $
               send $
-                completeMultipartUpload bucket key upId &
-                cMultipartUpload ?~ set cmuParts prts completedMultipartUpload
-      performUpload ::
-           (MonadAWS m, MonadError String m)
-        => Int
-        -> Int
-        -> Digest SHA256
-        -> D.DList ByteString
-        -> m UploadPartResponse
-      performUpload pnum size digest =
-        D.toList >>>
-        sourceList >>>
-        hashedBody digest (fromIntegral size) >>>
-        toBody >>> uploadPart bucket key pnum upId >>> send >=> checkUpload
-      checkUpload ::
-           (Monad m, MonadError String m)
-        => UploadPartResponse
-        -> m UploadPartResponse
-      checkUpload upr = do
-        when (upr ^. uprsResponseStatus /= 200) $
-          throwError "Failed to upload piece"
-        return upr
-  (Right <$> go D.empty 0 hashInit 1 D.empty) `catchC` \(except :: SomeException) ->
-    Left . (, except) <$> lift (send (abortMultipartUpload bucket key upId))
-      -- Whatever happens, we abort the upload and return the exception
+              completeMultipartUpload bucket key upId &
+              cMultipartUpload ?~ set cmuParts prts completedMultipartUpload
+    logStr :: String -> m ()
+    logStr msg = do
+      logger <- liftAWS $ view envLogger
+      liftIO $ logger Debug $ stringUtf8 msg
+    performUpload ::
+         (MonadAWS m)
+      => CreateMultipartUploadResponse
+      -> Int
+      -> Int
+      -> Digest SHA256
+      -> D.DList ByteString
+      -> m (Either String UploadPartResponse)
+    performUpload multiPartUpload pnum size digest =
+      let Just upId = multiPartUpload ^. cmursUploadId
+          bucket = multiPartUploadDesc ^. cmuBucket
+          key = multiPartUploadDesc ^. cmuKey
+       in D.toList >>>
+          sourceList >>>
+          hashedBody digest (fromIntegral size) >>>
+          toBody >>> uploadPart bucket key pnum upId >>> send >=> checkUpload
+    checkUpload ::
+         (Monad m) => UploadPartResponse -> m (Either String UploadPartResponse)
+    checkUpload upr = do
+      let responseCode = upr ^. uprsResponseStatus
+      if (responseCode /= 200)
+        then pure $
+             Left $
+             "Non-success response from upload part: " <> show responseCode
+        else pure $ Right upr
 
 -- | Specifies whether to upload a file or 'ByteString
 data UploadLocation
